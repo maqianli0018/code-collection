@@ -1,0 +1,203 @@
+`include "constants.vams"
+`include "disciplines.vams"
+
+// PRBS checker for analog simulations. It can either start from a known seed
+// or acquire the starting phase from the first ORDER received bits.
+//
+// LFSR convention:
+//   expected_bit = lfsr[ORDER-1]
+//   feedback     = lfsr[ORDER-1] XOR lfsr[TAP-1]
+//                  XOR optional TAP2/TAP3 terms
+//   lfsr         = {lfsr[ORDER-2:0], feedback}
+//
+// Common ORDER/TAP/TAP2/TAP3 settings:
+//   PRBS7  :  7/6/0/0     (x^7  + x^6  + 1)
+//   PRBS9  :  9/5/0/0     (x^9  + x^5  + 1)
+//   PRBS13 : 13/12/2/1    (x^13 + x^12 + x^2 + x + 1)
+//   PRBS15 : 15/14/0/0    (x^15 + x^14 + 1)
+//   PRBS23 : 23/18/0/0    (x^23 + x^18 + 1)
+//   PRBS31 : 31/28/0/0    (x^31 + x^28 + 1)
+//
+// In fixed-seed mode, the first expected bit is SEED[ORDER-1]. Drive the
+// clock so its rising threshold crossing occurs near the center of each bit.
+
+module prbs_checker(din, clk, rst, err, locked, bit_count, error_count);
+    input  din, clk, rst;
+    output err, locked, bit_count, error_count;
+    electrical din, clk, rst;
+    electrical err, locked, bit_count, error_count;
+
+    parameter integer ORDER = 7 from [2:31];
+    parameter integer TAP = 6 from [1:30];
+    parameter integer TAP2 = 0 from [0:30];
+    parameter integer TAP3 = 0 from [0:30];
+    parameter integer SEED = 127;
+    parameter integer AUTO_ALIGN = 1 from [0:1];
+    parameter integer SKIP_BITS = 0 from [0:inf);
+    parameter integer INVERT_DATA = 0 from [0:1];
+    parameter integer STOP_ON_ERROR = 0 from [0:1];
+    parameter integer REPORT_EVERY = 0 from [0:inf);
+
+    parameter real VTH_CLK = 0.5;
+    parameter real VTH_DATA = 0.5;
+    parameter real VTH_RST = 0.5;
+    parameter real VHIGH = 1.0;
+    parameter real VLOW = 0.0;
+    parameter real COUNT_SCALE = 1.0;
+    parameter real TDELAY = 0.0 from [0:inf);
+    parameter real TRISE = 1p from (0:inf);
+    parameter real TFALL = 1p from (0:inf);
+
+    integer lfsr;
+    integer lfsr_mask;
+    integer expected_bit;
+    integer sampled_bit;
+    integer feedback_bit;
+    integer error_state;
+    integer locked_state;
+    integer bits_seen;
+    integer bits_checked;
+    integer errors_seen;
+    integer acquire_seed;
+    integer acquire_count;
+    integer acquire_index;
+
+    analog begin
+        @(initial_step) begin
+            if ((TAP >= ORDER) ||
+                ((TAP2 != 0) && (TAP2 >= ORDER)) ||
+                ((TAP3 != 0) && (TAP3 >= ORDER))) begin
+                $error(
+                    "prbs_checker: every non-zero TAP must be smaller than ORDER.");
+            end
+
+            // Avoid a signed 32-bit overflow when ORDER is 31.
+            if (ORDER == 31)
+                lfsr_mask = 2147483647;
+            else
+                lfsr_mask = (1 << ORDER) - 1;
+
+            lfsr = SEED & lfsr_mask;
+            if (lfsr == 0) begin
+                lfsr = 1;
+                $warning("prbs_checker: all-zero SEED is invalid; using seed=1.");
+            end
+
+            error_state = 0;
+            locked_state = 0;
+            bits_seen = 0;
+            bits_checked = 0;
+            errors_seen = 0;
+            acquire_seed = 0;
+            acquire_count = 0;
+        end
+
+        @(cross(V(clk) - VTH_CLK, +1)) begin
+            if (V(rst) > VTH_RST) begin
+                lfsr = SEED & lfsr_mask;
+                if (lfsr == 0)
+                    lfsr = 1;
+
+                error_state = 0;
+                locked_state = 0;
+                bits_seen = 0;
+                bits_checked = 0;
+                errors_seen = 0;
+                acquire_seed = 0;
+                acquire_count = 0;
+            end
+            else begin
+                sampled_bit = (V(din) > VTH_DATA);
+                if (INVERT_DATA != 0)
+                    sampled_bit = 1 - sampled_bit;
+
+                error_state = 0;
+
+                if ((AUTO_ALIGN != 0) && (acquire_count < ORDER)) begin
+                    acquire_seed = ((acquire_seed << 1) & lfsr_mask) |
+                                   sampled_bit;
+                    acquire_count = acquire_count + 1;
+
+                    if (acquire_count == ORDER) begin
+                        lfsr = acquire_seed;
+                        if (lfsr == 0) begin
+                            lfsr = 1;
+                            $warning(
+                                "prbs_checker: acquired all-zero state; check input thresholds and activity.");
+                        end
+
+                        // The captured bits describe the LFSR state before
+                        // the acquisition window. Advance to the state that
+                        // follows those ORDER observed output bits.
+                        for (acquire_index = 0;
+                             acquire_index < ORDER;
+                             acquire_index = acquire_index + 1) begin
+                            expected_bit = (lfsr >> (ORDER - 1)) & 1;
+                            feedback_bit = expected_bit ^
+                                           ((lfsr >> (TAP - 1)) & 1);
+                            if (TAP2 != 0)
+                                feedback_bit = feedback_bit ^
+                                    ((lfsr >> (TAP2 - 1)) & 1);
+                            if (TAP3 != 0)
+                                feedback_bit = feedback_bit ^
+                                    ((lfsr >> (TAP3 - 1)) & 1);
+                            lfsr = ((lfsr << 1) & lfsr_mask) |
+                                   feedback_bit;
+                        end
+                    end
+                end
+                else begin
+                    expected_bit = (lfsr >> (ORDER - 1)) & 1;
+                    feedback_bit = expected_bit ^
+                                   ((lfsr >> (TAP - 1)) & 1);
+                    if (TAP2 != 0)
+                        feedback_bit = feedback_bit ^
+                            ((lfsr >> (TAP2 - 1)) & 1);
+                    if (TAP3 != 0)
+                        feedback_bit = feedback_bit ^
+                            ((lfsr >> (TAP3 - 1)) & 1);
+                    lfsr = ((lfsr << 1) & lfsr_mask) | feedback_bit;
+
+                    bits_seen = bits_seen + 1;
+
+                    if (bits_seen > SKIP_BITS) begin
+                        locked_state = 1;
+                        bits_checked = bits_checked + 1;
+
+                        if (sampled_bit != expected_bit) begin
+                            error_state = 1;
+                            errors_seen = errors_seen + 1;
+                            if (STOP_ON_ERROR != 0)
+                                $fatal(0,
+                                    "prbs_checker: mismatch at checked bit %0d, expected=%0d received=%0d",
+                                    bits_checked, expected_bit, sampled_bit);
+                        end
+
+                        if ((REPORT_EVERY > 0) &&
+                            ((bits_checked % REPORT_EVERY) == 0)) begin
+                            $strobe(
+                                "prbs_checker: checked=%0d errors=%0d last_expected=%0d last_received=%0d",
+                                bits_checked, errors_seen,
+                                expected_bit, sampled_bit);
+                        end
+                    end
+                end
+            end
+        end
+
+        @(final_step) begin
+            $strobe("prbs_checker final: checked=%0d errors=%0d",
+                    bits_checked, errors_seen);
+        end
+
+        V(err) <+ transition(error_state ? VHIGH : VLOW,
+                             TDELAY, TRISE, TFALL);
+        V(locked) <+ transition(locked_state ? VHIGH : VLOW,
+                                TDELAY, TRISE, TFALL);
+        V(bit_count) <+ transition(COUNT_SCALE * bits_checked,
+                                   TDELAY, TRISE, TFALL);
+        V(error_count) <+ transition(COUNT_SCALE * errors_seen,
+                                     TDELAY, TRISE, TFALL);
+    end
+endmodule
+
