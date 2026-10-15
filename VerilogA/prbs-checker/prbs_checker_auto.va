@@ -1,0 +1,294 @@
+`include "constants.vams"
+`include "disciplines.vams"
+
+// Data-driven PRBS checker for transient simulation.
+//
+// No external sampling clock is required. The checker detects data threshold
+// crossings, places an internal periodic sampler near the eye center, and
+// tracks later data edges. BIT_RATE must match the serial binary bit rate.
+//
+// LFSR convention:
+//   expected_bit = lfsr[ORDER-1]
+//   feedback     = lfsr[ORDER-1] XOR lfsr[TAP-1]
+//                  XOR optional TAP2/TAP3 terms
+//   lfsr         = {lfsr[ORDER-2:0], feedback}
+//
+// Cadence vsource PN13 settings:
+//   Cadence polynomial taps = 13, 4, 3, 1, 0
+//   polynomial = x^13 + x^4 + x^3 + x + 1
+//
+// Cadence numbers the physical taps from left to right, starting at zero.
+// The corresponding settings in this model are used directly:
+//   ORDER=13, TAP=4, TAP2=3, TAP3=1
+
+module prbs_checker_auto(
+    din, rst, err, locked, bit_count, error_count
+);
+    input  din, rst;
+    output err, locked, bit_count, error_count;
+    electrical din, rst;
+    electrical err, locked, bit_count, error_count;
+
+    parameter integer ORDER = 13 from [2:31];
+    parameter integer TAP = 4 from [1:30];
+    parameter integer TAP2 = 3 from [0:30];
+    parameter integer TAP3 = 1 from [0:30];
+
+    parameter real BIT_RATE = 32e9 from (0:inf);
+    parameter real SAMPLE_PHASE = 0.5 from (0:1);
+    parameter real PHASE_GAIN = 0.25 from [0:1];
+
+    parameter integer SKIP_BITS = 0 from [0:inf);
+    parameter integer LOCK_BITS = 64 from [1:inf);
+    parameter integer UNLOCK_ERRORS = 3 from [1:inf);
+    parameter integer INVERT_DATA = 0 from [0:1];
+    parameter integer STOP_ON_ERROR = 0 from [0:1];
+    parameter integer REPORT_EVERY = 0 from [0:inf);
+
+    parameter real VTH_DATA = 0.5;
+    parameter real VTH_RST = 0.5;
+    parameter real VHIGH = 1.0;
+    parameter real VLOW = 0.0;
+    parameter real COUNT_SCALE = 1.0;
+    parameter real TDELAY = 0.0 from [0:inf);
+    parameter real TRISE = 1p from (0:inf);
+    parameter real TFALL = 1p from (0:inf);
+
+    integer lfsr;
+    integer lfsr_mask;
+    integer expected_bit;
+    integer sampled_bit;
+    integer feedback_bit;
+    integer acquire_seed;
+    integer acquire_count;
+    integer acquire_index;
+    integer skip_count;
+    integer correct_streak;
+    integer error_streak;
+    integer error_state;
+    integer locked_state;
+    integer bits_checked;
+    integer errors_seen;
+    integer timer_running;
+
+    real bit_period;
+    real next_sample_time;
+    real edge_sample_time;
+
+    analog begin
+        @(initial_step) begin
+            if ((TAP >= ORDER) ||
+                ((TAP2 != 0) && (TAP2 >= ORDER)) ||
+                ((TAP3 != 0) && (TAP3 >= ORDER))) begin
+                $error(
+                    "prbs_checker_auto: every non-zero TAP must be smaller than ORDER.");
+            end
+
+            if (ORDER == 31)
+                lfsr_mask = 2147483647;
+            else
+                lfsr_mask = (1 << ORDER) - 1;
+
+            bit_period = 1.0 / BIT_RATE;
+            next_sample_time = 1e30;
+            timer_running = 0;
+
+            lfsr = 1;
+            acquire_seed = 0;
+            acquire_count = 0;
+            skip_count = 0;
+            correct_streak = 0;
+            error_streak = 0;
+            error_state = 0;
+            locked_state = 0;
+            bits_checked = 0;
+            errors_seen = 0;
+        end
+
+        // Reset is asynchronous for the behavioral checker. Sampling restarts
+        // from the first data transition observed after reset is released.
+        @(cross(V(rst) - VTH_RST, +1)) begin
+            next_sample_time = 1e30;
+            timer_running = 0;
+
+            lfsr = 1;
+            acquire_seed = 0;
+            acquire_count = 0;
+            skip_count = 0;
+            correct_streak = 0;
+            error_streak = 0;
+            error_state = 0;
+            locked_state = 0;
+            bits_checked = 0;
+            errors_seen = 0;
+        end
+
+        // A data threshold crossing marks a UI boundary. Start the internal
+        // sampler at SAMPLE_PHASE*UI after the boundary. Later crossings make
+        // a proportional phase correction without disturbing long CID runs.
+        @(cross(V(din) - VTH_DATA, 0)) begin
+            if (V(rst) < VTH_RST) begin
+                edge_sample_time =
+                    $abstime + SAMPLE_PHASE * bit_period;
+
+                if (timer_running == 0) begin
+                    next_sample_time = edge_sample_time;
+                    timer_running = 1;
+                end
+                else begin
+                    next_sample_time = next_sample_time +
+                        PHASE_GAIN *
+                        (edge_sample_time - next_sample_time);
+                end
+            end
+        end
+
+        @(timer(next_sample_time)) begin
+            if (timer_running != 0) begin
+                if (V(rst) > VTH_RST) begin
+                    next_sample_time = 1e30;
+                    timer_running = 0;
+                end
+                else begin
+                    sampled_bit = (V(din) > VTH_DATA);
+                    if (INVERT_DATA != 0)
+                        sampled_bit = 1 - sampled_bit;
+
+                    error_state = 0;
+
+                    // Capture ORDER received bits to reconstruct the unknown
+                    // PRBS phase.
+                    if (acquire_count < ORDER) begin
+                        acquire_seed =
+                            ((acquire_seed << 1) & lfsr_mask) |
+                            sampled_bit;
+                        acquire_count = acquire_count + 1;
+
+                        if (acquire_count == ORDER) begin
+                            lfsr = acquire_seed;
+                            if (lfsr == 0) begin
+                                lfsr = 1;
+                                $warning(
+                                    "prbs_checker_auto: acquired all-zero state; check BIT_RATE, threshold, and input activity.");
+                            end
+
+                            // Captured output bits describe the state at the
+                            // beginning of the acquisition window.
+                            for (acquire_index = 0;
+                                 acquire_index < ORDER;
+                                 acquire_index = acquire_index + 1) begin
+                                expected_bit =
+                                    (lfsr >> (ORDER - 1)) & 1;
+                                feedback_bit = expected_bit ^
+                                    ((lfsr >> (TAP - 1)) & 1);
+                                if (TAP2 != 0)
+                                    feedback_bit = feedback_bit ^
+                                        ((lfsr >> (TAP2 - 1)) & 1);
+                                if (TAP3 != 0)
+                                    feedback_bit = feedback_bit ^
+                                        ((lfsr >> (TAP3 - 1)) & 1);
+                                lfsr =
+                                    ((lfsr << 1) & lfsr_mask) |
+                                    feedback_bit;
+                            end
+                        end
+                    end
+                    else begin
+                        expected_bit = (lfsr >> (ORDER - 1)) & 1;
+                        feedback_bit = expected_bit ^
+                            ((lfsr >> (TAP - 1)) & 1);
+                        if (TAP2 != 0)
+                            feedback_bit = feedback_bit ^
+                                ((lfsr >> (TAP2 - 1)) & 1);
+                        if (TAP3 != 0)
+                            feedback_bit = feedback_bit ^
+                                ((lfsr >> (TAP3 - 1)) & 1);
+                        lfsr = ((lfsr << 1) & lfsr_mask) |
+                               feedback_bit;
+
+                        if (skip_count < SKIP_BITS) begin
+                            skip_count = skip_count + 1;
+                        end
+                        else begin
+                            bits_checked = bits_checked + 1;
+
+                            if (sampled_bit == expected_bit) begin
+                                correct_streak = correct_streak + 1;
+                                error_streak = 0;
+
+                                if ((locked_state == 0) &&
+                                    (correct_streak >= LOCK_BITS)) begin
+                                    locked_state = 1;
+                                    $strobe(
+                                        "prbs_checker_auto: locked at checked bit %0d",
+                                        bits_checked);
+                                end
+                            end
+                            else begin
+                                error_state = 1;
+                                errors_seen = errors_seen + 1;
+                                correct_streak = 0;
+                                error_streak = error_streak + 1;
+
+                                if (STOP_ON_ERROR != 0)
+                                    $fatal(0,
+                                        "prbs_checker_auto: mismatch at checked bit %0d, expected=%0d received=%0d",
+                                        bits_checked, expected_bit,
+                                        sampled_bit);
+
+                                // Before lock, one mismatch normally means the
+                                // acquisition window contained a bad sample.
+                                if (locked_state == 0) begin
+                                    acquire_seed = 0;
+                                    acquire_count = 0;
+                                    skip_count = 0;
+                                    error_streak = 0;
+                                end
+                                else if (error_streak >=
+                                         UNLOCK_ERRORS) begin
+                                    locked_state = 0;
+                                    acquire_seed = 0;
+                                    acquire_count = 0;
+                                    skip_count = 0;
+                                    correct_streak = 0;
+                                    error_streak = 0;
+                                    $strobe(
+                                        "prbs_checker_auto: lock lost at checked bit %0d; re-acquiring",
+                                        bits_checked);
+                                end
+                            end
+
+                            if ((REPORT_EVERY > 0) &&
+                                ((bits_checked %
+                                  REPORT_EVERY) == 0)) begin
+                                $strobe(
+                                    "prbs_checker_auto: checked=%0d errors=%0d locked=%0d",
+                                    bits_checked, errors_seen,
+                                    locked_state);
+                            end
+                        end
+                    end
+
+                    next_sample_time =
+                        next_sample_time + bit_period;
+                end
+            end
+        end
+
+        @(final_step) begin
+            $strobe(
+                "prbs_checker_auto final: checked=%0d errors=%0d locked=%0d",
+                bits_checked, errors_seen, locked_state);
+        end
+
+        V(err) <+ transition(error_state ? VHIGH : VLOW,
+                             TDELAY, TRISE, TFALL);
+        V(locked) <+ transition(locked_state ? VHIGH : VLOW,
+                                TDELAY, TRISE, TFALL);
+        V(bit_count) <+ transition(COUNT_SCALE * bits_checked,
+                                   TDELAY, TRISE, TFALL);
+        V(error_count) <+ transition(COUNT_SCALE * errors_seen,
+                                     TDELAY, TRISE, TFALL);
+    end
+endmodule
+
